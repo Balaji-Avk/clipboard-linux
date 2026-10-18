@@ -1,0 +1,14 @@
+[Unit]
+Description=Clipboard history daemon (Super+V clipboard manager)
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/clipboard-linux daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target graphical-session.target

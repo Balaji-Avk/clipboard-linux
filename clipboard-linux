@@ -1,0 +1,1062 @@
+#!/usr/bin/env python3
+"""clipboard-linux - Windows-style clipboard history (Super+V) for Linux desktops.
+
+A systemd user service runs a small daemon in the background that:
+
+  * watches the clipboard (via X11/XWayland, which GNOME bridges to Wayland),
+  * keeps a rolling history of copied text (capped, oldest unpinned evicted),
+  * shows a dialog on demand (bind it to Super+V) listing the history;
+    picking an entry copies it back to the clipboard and closes the dialog.
+
+On daemon start the history is wiped except pinned entries, so restarting the
+service (or rebooting) starts you fresh but keeps what you deliberately pinned.
+
+Commands:
+  daemon           Run the background daemon (started by the systemd user service)
+  toggle           Show the dialog, or hide it if it is already visible
+  show / hide      Show or hide the dialog
+  quit             Stop the daemon
+  install          Install to ~/.local/bin + systemd user service, then enable it
+  uninstall        Remove the systemd user service (--purge also removes the
+                   installed binary and stored data)
+  shortcut-hint    Print instructions for binding Super+V in GNOME settings
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+APP_NAME = "clipboard-linux"
+MAX_ENTRIES = 100
+MAX_CONTENT_CHARS = 256 * 1024
+MAX_WIRE_BYTES = 4 * 1024 * 1024
+POLL_INTERVAL = 0.6            # seconds between clipboard polls
+SELF_SET_TTL = 5.0             # ignore clipboard echoes of our own copies (seconds)
+SHOW_GRACE = 0.35              # ignore focus-out events right after showing (seconds)
+
+HOME = os.path.expanduser("~")
+DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), APP_NAME
+)
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+BIN_PATH = os.path.join(HOME, ".local", "bin", APP_NAME)
+UNIT_PATH = os.path.join(HOME, ".config", "systemd", "user", APP_NAME + ".service")
+SELF_PATH = os.path.abspath(os.path.realpath(sys.argv[0]))
+
+UNIT_TEMPLATE = """\
+[Unit]
+Description=Clipboard history daemon (Super+V clipboard manager)
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/clipboard-linux daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target graphical-session.target
+"""
+
+
+def runtime_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp/{}-{}".format(APP_NAME, os.getuid())
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        pass
+    return base
+
+
+SOCKET_PATH = os.path.join(runtime_dir(), APP_NAME + ".sock")
+
+
+def sha1_text(text):
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+
+
+def log(msg):
+    sys.stderr.write("[{}] {}\n".format(APP_NAME, msg))
+    sys.stderr.flush()
+
+
+def die(msg, code=1):
+    sys.stderr.write("{}: error: {}\n".format(APP_NAME, msg))
+    sys.exit(code)
+
+
+def which(name):
+    return shutil.which(name)
+
+
+# ---------------------------------------------------------------------------
+# Client side (talk to a running daemon over its unix socket)
+# ---------------------------------------------------------------------------
+
+def client(msg, timeout=3.0):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCKET_PATH)
+        s.sendall(json.dumps(msg).encode("utf-8") + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf:
+            raise OSError("daemon closed the connection")
+        return json.loads(buf.decode("utf-8", "replace"))
+    finally:
+        s.close()
+
+
+def daemon_is_running():
+    try:
+        return bool(client({"cmd": "ping"}, timeout=0.6).get("ok"))
+    except (OSError, ValueError):
+        return False
+
+
+def ensure_daemon_running():
+    if daemon_is_running():
+        return True
+    if os.path.exists(UNIT_PATH) and which("systemctl"):
+        subprocess.run(
+            ["systemctl", "--user", "start", APP_NAME],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if daemon_is_running():
+                return True
+            time.sleep(0.3)
+    return False
+
+
+def cmd_toggle(_args):
+    if not ensure_daemon_running():
+        die(
+            "daemon is not running (install it with '{} install')".format(APP_NAME)
+        )
+    reply = client({"cmd": "toggle"})
+    if not reply.get("ok"):
+        die(reply.get("error", "toggle failed"))
+
+
+def cmd_show(_args):
+    if not ensure_daemon_running():
+        die("daemon is not running (install it with '{} install')".format(APP_NAME))
+    client({"cmd": "show"})
+
+
+def cmd_hide(_args):
+    if not ensure_daemon_running():
+        die("daemon is not running (install it with '{} install')".format(APP_NAME))
+    client({"cmd": "hide"})
+
+
+def cmd_quit(_args):
+    try:
+        client({"cmd": "quit"})
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# History store
+# ---------------------------------------------------------------------------
+
+class HistoryStore(object):
+    """Rolling clipboard history persisted as JSON.
+
+    Entries are dicts: {"content": str, "ts": float, "pinned": bool}.
+    """
+
+    def __init__(self):
+        self.entries = []
+
+    def load_wiping_unpinned(self):
+        """Load history from disk, keeping pinned entries only (by design:
+        restarting the service erases everything except pinned values)."""
+        raw = []
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as fh:
+                raw = json.load(fh).get("entries", []) or []
+        except (OSError, ValueError):
+            raw = []
+        kept = []
+        for e in raw:
+            content = e.get("content")
+            if e.get("pinned") and isinstance(content, str) and content.strip():
+                if len(content) > MAX_CONTENT_CHARS:
+                    content = content[:MAX_CONTENT_CHARS]
+                kept.append(
+                    {"content": content, "ts": float(e.get("ts") or time.time()),
+                     "pinned": True}
+                )
+        kept.sort(key=lambda e: -e["ts"])
+        self.entries = kept
+        self.save()
+
+    def save(self):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = HISTORY_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "entries": self.entries}, fh)
+            os.replace(tmp, HISTORY_FILE)
+        except OSError as exc:
+            log("could not save history: {}".format(exc))
+
+    def all_sorted(self):
+        """Pinned first, then most recent first."""
+        return sorted(self.entries, key=lambda e: (0 if e["pinned"] else 1, -e["ts"]))
+
+    def find(self, entry_hash):
+        for e in self.entries:
+            if sha1_text(e["content"]) == entry_hash:
+                return e
+        return None
+
+    def ingest(self, content):
+        """Add new clipboard content. Returns True if history changed."""
+        if not isinstance(content, str) or not content.strip():
+            return False
+        if len(content) > MAX_CONTENT_CHARS:
+            content = content[:MAX_CONTENT_CHARS]
+        now = time.time()
+        digest = sha1_text(content)
+        for i, e in enumerate(self.entries):
+            if sha1_text(e["content"]) == digest:
+                self.entries.pop(i)
+                e["ts"] = now           # copying something again bumps it to top
+                self.entries.insert(0, e)
+                self.save()
+                return True
+        self.entries.insert(0, {"content": content, "ts": now, "pinned": False})
+        self._evict()
+        self.save()
+        return True
+
+    def _evict(self):
+        while len(self.entries) > MAX_ENTRIES:
+            victim = None
+            for i in range(len(self.entries) - 1, -1, -1):
+                if not self.entries[i]["pinned"]:
+                    victim = i
+                    break
+            if victim is None:      # everything is pinned; keep the overflow
+                break
+            self.entries.pop(victim)
+
+    def bump(self, entry_hash):
+        """Move an entry to the top with a fresh timestamp (picking it from the
+        dialog counts as a copy, same as in the Windows clipboard history)."""
+        e = self.find(entry_hash)
+        if e is None:
+            return
+        self.entries.remove(e)
+        e["ts"] = time.time()
+        self.entries.insert(0, e)
+        self.save()
+
+    def remove(self, entry_hash):
+        e = self.find(entry_hash)
+        if e is not None:
+            self.entries.remove(e)
+            self.save()
+
+    def toggle_pin(self, entry_hash):
+        e = self.find(entry_hash)
+        if e is None:
+            return None
+        e["pinned"] = not e["pinned"]
+        self.save()
+        return e["pinned"]
+
+
+# ---------------------------------------------------------------------------
+# Clipboard access
+# ---------------------------------------------------------------------------
+
+def read_clipboard_text():
+    """Read the clipboard as text via XWayland. Returns None if the clipboard
+    is empty, unreadable, or holds non-text content (e.g. an image).
+
+    On GNOME, X11 selections are bridged to the Wayland clipboard, so this
+    sees copies made by both Wayland and X11 applications.
+    """
+    if not (os.environ.get("DISPLAY") and which("xclip")):
+        return None
+    try:
+        proc = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o", "-target", "UTF8_STRING"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def set_clipboard_text(content):
+    data = content.encode("utf-8")
+    if os.environ.get("WAYLAND_DISPLAY") and which("wl-copy"):
+        try:
+            subprocess.run(
+                ["wl-copy", "--type", "text/plain;charset=utf-8"],
+                input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log("wl-copy failed: {}".format(exc))
+    if os.environ.get("DISPLAY") and which("xclip"):
+        try:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard", "-in"],
+                input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log("xclip failed: {}".format(exc))
+
+
+# ---------------------------------------------------------------------------
+# Dialog (GTK)
+# ---------------------------------------------------------------------------
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import GLib, Gdk, Gtk, Pango  # noqa: E402
+
+
+def _fmt_rel_time(ts):
+    delta = max(0.0, time.time() - ts)
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return "{} min ago".format(int(delta // 60))
+    if delta < 86400:
+        return "{} h ago".format(int(delta // 3600))
+    if delta < 172800:
+        return "yesterday"
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _preview_text(content):
+    lines = content.splitlines()
+    if not lines:
+        return "(whitespace)"
+    text = "\n".join(lines[:2])
+    if len(lines) > 2:
+        text += " ..."
+    return text
+
+
+class ClipboardDialog(Gtk.Window):
+    def __init__(self, daemon):
+        super().__init__(title="Clipboard History")
+        self.daemon = daemon
+        self._shown_ts = 0.0
+        self._menu_open = False
+
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_position(Gtk.WindowPosition.NONE)
+        self.set_default_size(460, 480)
+        self.stick()
+
+        self.connect("key-press-event", self._on_key)
+        self.connect("focus-out-event", self._on_focus_out)
+        self.connect("delete-event", self._on_delete)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_margin_top(10)
+        header.set_margin_bottom(6)
+        header.set_margin_start(10)
+        header.set_margin_end(10)
+        self.search = Gtk.Entry()
+        self.search.set_placeholder_text("Type to search clipboard history...")
+        self.search.connect("changed", lambda *_: self.refresh())
+        header.pack_start(self.search, True, True, 0)
+        outer.pack_start(header, False, False, 0)
+
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.set_activate_on_single_click(False)
+        self.listbox.connect("row-activated", self._on_row_activated)
+        self.listbox.connect("button-press-event", self._on_list_click)
+        self.placeholder = Gtk.Label(label="Clipboard history is empty")
+        self.listbox.set_placeholder(self.placeholder)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+        scrolled.add(self.listbox)
+        outer.pack_start(scrolled, True, True, 0)
+
+        footer = Gtk.Label(label="Enter: copy  |  Right-click: pin/delete  |  Esc: close")
+        footer.get_style_context().add_class("dim-label")
+        footer.set_margin_top(4)
+        footer.set_margin_bottom(8)
+        outer.pack_start(footer, False, False, 0)
+
+        self.add(outer)
+        self.refresh()
+
+    # -- visibility ---------------------------------------------------------
+
+    def show_dialog(self):
+        self.search.set_text("")
+        self.refresh()
+        self._position_near_pointer()
+        self._shown_ts = time.time()
+        self.show_all()
+        self.present()
+        self.search.grab_focus()
+
+    def hide_dialog(self):
+        self.hide()
+
+    def _position_near_pointer(self):
+        """Place the dialog close to the mouse cursor. This requires the X11
+        backend (the daemon forces GDK_BACKEND=x11): Wayland forbids clients
+        from querying the pointer or positioning their windows."""
+        display = Gdk.Display.get_default()
+        px = py = None
+        try:
+            seat = display.get_default_seat()
+            pointer = seat.get_pointer() if seat else None
+            if pointer is not None:
+                _screen, x, y = pointer.get_position()
+                px, py = x, y
+        except Exception:
+            pass
+
+        if not self.get_realized():
+            self.realize()
+        width, height = self.get_size()
+
+        monitor = None
+        if px is not None and (px > 0 or py > 0):
+            try:
+                monitor = display.get_monitor_at_point(px, py)
+            except Exception:
+                monitor = None
+        if monitor is None:
+            monitor = display.get_primary_monitor()
+        if monitor is None and display.get_n_monitors() > 0:
+            monitor = display.get_monitor(0)
+        if monitor is None:
+            return
+
+        geo = monitor.get_geometry()
+        if px is None or (px == 0 and py == 0):
+            x = geo.x + max((geo.width - width) // 2, 8)
+            y = geo.y + max((geo.height - height) // 2, 8)
+        else:
+            x = px + 18
+            y = py + 18
+        x = max(geo.x + 8, min(x, geo.x + geo.width - width - 8))
+        y = max(geo.y + 8, min(y, geo.y + geo.height - height - 8))
+        self.move(x, y)
+
+    # -- events -------------------------------------------------------------
+
+    def _on_delete(self, *_args):
+        self.hide()
+        return True
+
+    def _on_focus_out(self, _widget, _event):
+        if self._menu_open:
+            return False
+        if time.time() - self._shown_ts < SHOW_GRACE:
+            return False
+        self.hide()
+        return False
+
+    def _on_key(self, _widget, event):
+        key = event.keyval
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+
+        if key == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        if key == Gdk.KEY_Delete:
+            self._delete_selected()
+            return True
+        if ctrl and key in (Gdk.KEY_p, Gdk.KEY_P):
+            self._toggle_pin_selected()
+            return True
+
+        focused = self.get_focus()
+        if focused is self.search:
+            if key in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+                row = self.listbox.get_row_at_index(0)
+                if row is not None:
+                    self.listbox.select_row(row)
+                    row.grab_focus()
+                return True
+            if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                row = self.listbox.get_row_at_index(0)
+                if row is not None:
+                    self._select_row(row)
+                return True
+        else:
+            if key in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+                row = self.listbox.get_selected_row()
+                if row is not None and row.get_index() == 0:
+                    self.search.grab_focus()
+                    return True
+        return False
+
+    def _on_list_click(self, _listbox, event):
+        row = self.listbox.get_row_at_y(int(event.y))
+        if row is None:
+            return False
+        if event.button == 1:
+            self.listbox.select_row(row)
+            self._select_row(row)
+            return True
+        if event.button == 3:
+            self.listbox.select_row(row)
+            self._popup_row_menu(row, event)
+            return True
+        return False
+
+    def _on_row_activated(self, _listbox, row):
+        self._select_row(row)
+
+    # -- rows ---------------------------------------------------------------
+
+    def refresh(self):
+        query = self.search.get_text().strip().casefold()
+        entries = self.daemon.store.all_sorted()
+        if query:
+            entries = [e for e in entries if query in e["content"].casefold()]
+        for child in self.listbox.get_children():
+            child.destroy()
+        for e in entries:
+            self.listbox.add(self._make_row(e))
+        if query:
+            self.placeholder.set_text("No matches")
+        else:
+            self.placeholder.set_text("Clipboard history is empty")
+
+    def _make_row(self, entry):
+        row = Gtk.ListBoxRow()
+        row.entry_hash = sha1_text(entry["content"])
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        preview = Gtk.Label(label=_preview_text(entry["content"]), xalign=0)
+        preview.set_ellipsize(Pango.EllipsizeMode.END)
+        preview.set_lines(2)
+        preview.set_max_width_chars(44)
+        star = "\u2605 pinned \u00b7 " if entry["pinned"] else ""
+        meta = Gtk.Label(
+            label="{}{} \u00b7 {} chars".format(
+                star, _fmt_rel_time(entry["ts"]), len(entry["content"])
+            ),
+            xalign=0,
+        )
+        meta.get_style_context().add_class("dim-label")
+        col.pack_start(preview, False, False, 0)
+        col.pack_start(meta, False, False, 0)
+
+        box.pack_start(col, True, True, 0)
+        row.add(box)
+        return row
+
+    def _popup_row_menu(self, row, event):
+        entry_hash = row.entry_hash
+        entry = self.daemon.store.find(entry_hash)
+        if entry is None:
+            return
+        menu = Gtk.Menu()
+
+        item_copy = Gtk.MenuItem(label="Copy")
+        item_copy.connect("activate", lambda *_: self._select_by_hash(entry_hash))
+        menu.append(item_copy)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item_pin = Gtk.MenuItem(label="Unpin" if entry["pinned"] else "Pin")
+        item_pin.connect(
+            "activate",
+            lambda *_: self.daemon.store.toggle_pin(entry_hash) or self.refresh(),
+        )
+        menu.append(item_pin)
+
+        item_delete = Gtk.MenuItem(label="Delete")
+        item_delete.connect(
+            "activate",
+            lambda *_: (self.daemon.store.remove(entry_hash), self.refresh()),
+        )
+        menu.append(item_delete)
+
+        menu.connect("selection-done", self._on_menu_done)
+        self._menu_open = True
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _on_menu_done(self, _menu):
+        self._menu_open = False
+        GLib.idle_add(self.refresh)
+
+    # -- actions ------------------------------------------------------------
+
+    def _select_row(self, row):
+        self._select_by_hash(row.entry_hash)
+
+    def _select_by_hash(self, entry_hash):
+        entry = self.daemon.store.find(entry_hash)
+        if entry is None:
+            return
+        self.daemon.mark_self(entry_hash)
+        self.daemon.store.bump(entry_hash)   # picking counts as a copy: to top
+        set_clipboard_text(entry["content"])
+        self.hide()
+
+    def _delete_selected(self):
+        row = self.listbox.get_selected_row()
+        if row is not None:
+            self.daemon.store.remove(row.entry_hash)
+            self.refresh()
+
+    def _toggle_pin_selected(self):
+        row = self.listbox.get_selected_row()
+        if row is not None:
+            self.daemon.store.toggle_pin(row.entry_hash)
+            self.refresh()
+
+
+# ---------------------------------------------------------------------------
+# Daemon
+# ---------------------------------------------------------------------------
+
+class Daemon(object):
+    def __init__(self):
+        self.store = HistoryStore()
+        self.store.load_wiping_unpinned()
+        self.dialog = ClipboardDialog(self)
+        self._stop = threading.Event()
+        self._socket = None
+        self._x11_last = None
+        self._self_hash = None
+        self._self_ts = 0.0
+
+    # lifecycle -------------------------------------------------------------
+
+    def start(self):
+        self._start_socket()
+        self._start_x11_watch()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._on_signal)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._on_signal)
+        log("daemon started (pid {}, {} history entries)".format(
+            os.getpid(), len(self.store.entries)))
+        Gtk.main()
+
+    def shutdown(self):
+        if self._stop.is_set():
+            return False
+        self._stop.set()
+        try:
+            self._socket.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+        self.store.save()
+        log("daemon stopped")
+        Gtk.main_quit()
+        return False
+
+    def _on_signal(self):
+        self.shutdown()
+        return GLib.SOURCE_REMOVE
+
+    # socket server ---------------------------------------------------------
+
+    def _start_socket(self):
+        if os.path.exists(SOCKET_PATH):
+            if daemon_is_running():
+                raise SystemExit(
+                    "{}: another daemon is already running".format(APP_NAME))
+            try:
+                os.unlink(SOCKET_PATH)
+            except OSError:
+                pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o600)
+        srv.listen(8)
+        self._socket = srv
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._socket.accept()
+            except OSError:
+                break
+            with conn:
+                reply = {"ok": False, "error": "unhandled"}
+                try:
+                    reply = self._dispatch(self._read_message(conn))
+                except Exception as exc:
+                    reply = {"ok": False, "error": str(exc)}
+                try:
+                    conn.sendall(json.dumps(reply).encode("utf-8") + b"\n")
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _read_message(conn):
+        buf = b""
+        while b"\n" not in buf and len(buf) < MAX_WIRE_BYTES:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.decode("utf-8", "replace"))
+
+    def _dispatch(self, msg):
+        cmd = msg.get("cmd")
+        if cmd == "ping":
+            return {"ok": True}
+        if cmd == "ingest":
+            self._to_gtk(self._ingest, msg.get("content"))
+            return {"ok": True}
+        if cmd == "toggle":
+            self._to_gtk(self._toggle)
+            return {"ok": True}
+        if cmd == "show":
+            self._to_gtk(self.dialog.show_dialog)
+            return {"ok": True}
+        if cmd == "hide":
+            self._to_gtk(self.dialog.hide_dialog)
+            return {"ok": True}
+        if cmd == "quit":
+            GLib.idle_add(self.shutdown)
+            return {"ok": True}
+        return {"ok": False, "error": "unknown command: {!r}".format(cmd)}
+
+    @staticmethod
+    def _to_gtk(fn, *args):
+        """Run fn() on the GTK main thread and wait for its result."""
+        if threading.current_thread() is threading.main_thread():
+            return fn(*args)
+        done = threading.Event()
+        box = {}
+
+        def run():
+            try:
+                box["result"] = fn(*args)
+            except Exception as exc:      # noqa: BLE001 - report back to caller
+                box["error"] = exc
+            done.set()
+
+        GLib.idle_add(run)
+        if not done.wait(5.0):
+            raise TimeoutError("GTK main thread is not responding")
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+    # clipboard watching ----------------------------------------------------
+
+    def _start_x11_watch(self):
+        if not (os.environ.get("DISPLAY") and which("xclip")):
+            log("warning: xclip/DISPLAY not available; clipboard watching disabled")
+            return
+        self._x11_last = read_clipboard_text()   # baseline: do NOT ingest
+        threading.Thread(target=self._x11_loop, daemon=True).start()
+
+    def _x11_loop(self):
+        while not self._stop.wait(POLL_INTERVAL):
+            text = read_clipboard_text()
+            if text is None:
+                continue
+            if self._x11_last is not None and text != self._x11_last:
+                try:
+                    client({"cmd": "ingest", "content": text}, timeout=3.0)
+                except OSError:
+                    pass
+            self._x11_last = text
+
+    # GTK-thread callbacks --------------------------------------------------
+
+    def _ingest(self, content):
+        if not isinstance(content, str):
+            return
+        digest = sha1_text(content)
+        if digest == self._self_hash and time.time() - self._self_ts < SELF_SET_TTL:
+            return                                  # echo of our own set
+        if self.store.ingest(content) and self.dialog.get_visible():
+            self.dialog.refresh()
+
+    def _toggle(self):
+        if self.dialog.get_visible():
+            self.dialog.hide_dialog()
+        else:
+            self.dialog.show_dialog()
+
+    def mark_self(self, entry_hash):
+        self._self_hash = entry_hash
+        self._self_ts = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Install / uninstall / shortcut hint
+# ---------------------------------------------------------------------------
+
+def cmd_install(_args):
+    os.makedirs(os.path.dirname(BIN_PATH), exist_ok=True)
+    if SELF_PATH != BIN_PATH:
+        shutil.copy2(SELF_PATH, BIN_PATH)
+        os.chmod(BIN_PATH, 0o755)
+        print("Installed binary: {}".format(BIN_PATH))
+    else:
+        print("Binary already in place: {}".format(BIN_PATH))
+
+    repo_unit = os.path.join(os.path.dirname(SELF_PATH), "clipboard-linux.service")
+    if os.path.isfile(repo_unit):
+        with open(repo_unit, "r", encoding="utf-8") as fh:
+            unit = fh.read()
+    else:
+        unit = UNIT_TEMPLATE
+    os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+    with open(UNIT_PATH, "w", encoding="utf-8") as fh:
+        fh.write(unit)
+    print("Installed service: {}".format(UNIT_PATH))
+
+    if not which("systemctl"):
+        die("systemctl not found - cannot enable the user service")
+    proc = subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        die("systemctl daemon-reload failed: {}".format(proc.stderr.strip()))
+    proc = subprocess.run(
+        ["systemctl", "--user", "enable", "--now", APP_NAME],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        die("systemctl enable --now failed: {}".format(proc.stderr.strip()))
+    print("Service enabled and started.")
+    if not which("xclip"):
+        print("WARNING: 'xclip' not found - clipboard watching needs it "
+              "(apt install xclip).")
+    if not which("wl-copy"):
+        print("WARNING: 'wl-copy' not found - copying from the dialog needs it "
+              "(apt install wl-clipboard).")
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    if os.path.dirname(BIN_PATH) not in path_dirs:
+        print("NOTE: add {} to your PATH to run '{}' from a shell.".format(
+            os.path.dirname(BIN_PATH), APP_NAME))
+    print()
+    cmd_shortcut_hint(_args)
+
+
+def cmd_uninstall(args):
+    if which("systemctl"):
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", APP_NAME],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.path.exists(UNIT_PATH):
+        os.remove(UNIT_PATH)
+        print("Removed service: {}".format(UNIT_PATH))
+    if which("systemctl"):
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if getattr(args, "purge", False):
+        if os.path.exists(BIN_PATH):
+            os.remove(BIN_PATH)
+            print("Removed binary: {}".format(BIN_PATH))
+        shutil.rmtree(DATA_DIR, ignore_errors=True)
+        print("Removed data: {}".format(DATA_DIR))
+    else:
+        print("Kept binary ({}) and data ({}); use --purge to remove them.".format(
+            BIN_PATH, DATA_DIR))
+
+
+def _existing_custom_bindings():
+    """Best-effort list of (name, binding) for GNOME custom shortcuts."""
+    out = []
+    if not which("gsettings"):
+        return out
+    try:
+        proc = subprocess.run(
+            ["gsettings", "get", "org.gnome.settings-daemon.plugins.media-keys",
+             "custom-keybindings"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+        paths = re.findall(r"'([^']+)'", proc.stdout)
+        schema = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:"
+        for path in paths:
+            def get(prop):
+                p = subprocess.run(
+                    ["gsettings", "get", schema + path, prop],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, timeout=5)
+                return p.stdout.strip().strip("'")
+            out.append((get("name"), get("binding")))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return out
+
+
+def cmd_shortcut_hint(_args):
+    conflicts = [
+        (name, binding) for name, binding in _existing_custom_bindings()
+        if binding and "<Super>v" in binding.replace(" ", "").lower()
+    ]
+    print("To open the clipboard history with Super+V, add a custom shortcut:")
+    print()
+    print("  GNOME Settings -> Keyboard -> Keyboard Shortcuts -> Custom Shortcuts")
+    print("  -> '+' to add:")
+    print()
+    print("      Name:    Clipboard History")
+    print("      Command: {} toggle".format(BIN_PATH))
+    print("      Key:     Super+V")
+    print()
+    print("(Wayland does not let applications grab global keys themselves, so")
+    print(" GNOME has to own the binding. Run '{} shortcut-hint' anytime.)".format(
+        APP_NAME))
+    if conflicts:
+        print()
+        print("WARNING: Super+V already appears to be used by:")
+        for name, binding in conflicts:
+            print("  - {} ({})".format(name or "(unnamed)", binding))
+        print("Remove or change that binding, or pick another key for this one.")
+
+
+# ---------------------------------------------------------------------------
+# Daemon bootstrap + entry point
+# ---------------------------------------------------------------------------
+
+def _merge_systemd_user_env():
+    """Pull display environment variables from the systemd user manager, which
+    gnome-session populates at login (a service started early may not have them
+    in its own environment yet)."""
+    if not which("systemctl"):
+        return
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    for line in proc.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, _sep, value = line.partition("=")
+        if key and value:
+            os.environ.setdefault(key, value)
+
+
+def bootstrap_daemon_env():
+    # Wait (up to ~30s) for the session display environment to appear; systemd
+    # may start us slightly before gnome-session exports WAYLAND_DISPLAY.
+    for _ in range(15):
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            break
+        _merge_systemd_user_env()
+        time.sleep(2)
+    # Force the X11 backend: it is the only way to place the dialog near the
+    # mouse cursor (Wayland forbids pointer queries and window positioning).
+    # GNOME bridges the X11 and Wayland clipboards, so nothing is lost.
+    if os.environ.get("DISPLAY") and "GDK_BACKEND" not in os.environ:
+        os.environ["GDK_BACKEND"] = "x11"
+
+
+def gtk_init():
+    ok = Gtk.init_check()
+    if isinstance(ok, tuple):
+        ok = ok[0]
+    if ok:
+        return
+    if os.environ.get("GDK_BACKEND") == "x11" and not os.environ.get("_CL_REEXEC"):
+        # XWayland unavailable - retry with the default (Wayland) backend.
+        env = dict(os.environ)
+        env.pop("GDK_BACKEND", None)
+        env["_CL_REEXEC"] = "1"
+        os.execve(sys.executable, [sys.executable] + sys.argv, env)
+    die("could not initialize GTK (no display?)")
+
+
+def cmd_daemon(_args):
+    bootstrap_daemon_env()
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        die("no display environment (DISPLAY/WAYLAND_DISPLAY unset); "
+            "is this a graphical session?")
+    gtk_init()
+    daemon = Daemon()
+    daemon.start()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Windows-style clipboard history dialog (Super+V) for Linux.")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("daemon", help="run the background daemon (used by the systemd service)")
+    sub.add_parser("toggle", help="show the dialog, or hide it if visible")
+    sub.add_parser("show", help="show the dialog")
+    sub.add_parser("hide", help="hide the dialog")
+    sub.add_parser("quit", help="stop the daemon")
+    install_p = sub.add_parser("install", help="install binary + systemd user service")
+    uninstall_p = sub.add_parser("uninstall", help="remove the systemd user service")
+    uninstall_p.add_argument("--purge", action="store_true",
+                             help="also remove the installed binary and stored data")
+    sub.add_parser("shortcut-hint", help="print instructions for binding Super+V in GNOME")
+    args = parser.parse_args(argv)
+
+    commands = {
+        "daemon": cmd_daemon,
+        "toggle": cmd_toggle,
+        "show": cmd_show,
+        "hide": cmd_hide,
+        "quit": cmd_quit,
+        "install": cmd_install,
+        "uninstall": cmd_uninstall,
+        "shortcut-hint": cmd_shortcut_hint,
+    }
+    if args.command is None:
+        parser.print_help()
+        return 0
+    commands[args.command](args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
